@@ -1,0 +1,260 @@
+#include <SoftwareSerial.h>
+
+#define BUTTON_PIN 4
+#define CALL_DURATION 300000
+#define SMS_INTERVAL 300000
+
+#define OK "OK"
+#define AT "AT"
+
+String gsm_response = "";
+String phone_number = "+916302779701";  // Replace with parent's number
+
+SoftwareSerial gsm(10, 11);  // RX, TX
+
+bool trackingActive = false;
+bool callActive = false;
+unsigned long lastSMSTime = 0;
+unsigned long callStartTime = 0;
+
+void setup()
+{
+    Serial.begin(9600);
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+    Serial.println(F("GSM Initializing..."));
+    initializeGSM();
+
+    Serial.println(F("Waiting for GSM response..."));
+    while (!getResponse(AT, OK, 5000))
+    {
+        delay(200);
+    }
+    Serial.println(F("✅ GSM Ready!"));
+
+    if (connectGSM())
+    {
+        Serial.println(F("✅ GSM Connected!"));
+    }
+}
+
+void loop()
+{
+    checkButtonPress();
+
+    if (trackingActive)
+    {
+        if (millis() - lastSMSTime >= SMS_INTERVAL)
+        {
+            sendGPSLocation();
+            lastSMSTime = millis();
+        }
+
+        if (callActive && (millis() - callStartTime >= CALL_DURATION))
+        {
+            endCall();
+        }
+    }
+}
+
+void checkButtonPress()
+{
+    static unsigned long pressStartTime = 0;
+    static bool lastButtonState = HIGH;
+    bool currentButtonState = digitalRead(BUTTON_PIN);
+
+    if (currentButtonState == LOW && lastButtonState == HIGH)
+    {
+        pressStartTime = millis();
+    }
+
+    if (currentButtonState == HIGH && lastButtonState == LOW)
+    {
+        unsigned long pressDuration = millis() - pressStartTime;
+
+        if (pressDuration >= 5000)
+        {
+            trackingActive = false;
+            endCall();
+            Serial.println(F("⚠️ Tracking Stopped!"));
+        }
+        else
+        {
+            trackingActive = true;
+            initiateCall();
+            lastSMSTime = millis();
+            Serial.println(F("✅ Tracking Started!"));
+        }
+    }
+
+    lastButtonState = currentButtonState;
+}
+
+void sendGPSLocation()
+{
+    String latitude = "";
+    String longitude = "";
+
+    if (getGPSCoordinates(latitude, longitude))
+    {
+        String googleMapsLink = formatGoogleMapsLink(latitude, longitude);
+        Serial.println("📡 Sending GPS location: " + googleMapsLink);
+        sendSMS(phone_number, googleMapsLink);
+    }
+    else
+    {
+        Serial.println(F("❌ Failed to get GPS coordinates."));
+        sendSMS(phone_number, "❌ Unable to get GPS location.");
+    }
+}
+
+String formatGoogleMapsLink(String latitude, String longitude)
+{
+    return "https://www.google.com/maps?q=" + latitude + "," + longitude;
+}
+
+void sendSMS(String number, String sms)
+{
+    Serial.println(F("📲 Sending SMS..."));
+    if (!getResponse(F("AT+CMGF=1"), OK, 3000)) 
+    {
+        Serial.println(F("❌ Failed to set SMS mode."));
+        return;
+    }
+
+    if (!getResponse("AT+CMGS=\"" + number + "\"\r", ">", 3000)) 
+    {
+        Serial.println(F("❌ Failed to set recipient."));
+        return;
+    }
+
+    gsm.print(sms);
+    delay(1000);
+    gsm.println((char)26);  // Ctrl+Z
+
+    Serial.println(F("✅ SMS Sent Successfully!"));
+}
+
+void initiateCall()
+{
+    Serial.println(F("📞 Dialing Parent..."));
+    gsm.println("ATD" + phone_number + ";");
+    callActive = true;
+    callStartTime = millis();
+}
+
+void endCall()
+{
+    if (callActive)
+    {
+        gsm.println("ATH");
+        Serial.println(F("📞 Call Ended."));
+        callActive = false;
+    }
+}
+
+bool getResponse(String cmd, String response, int timeout)
+{
+    Serial.println("Sending command: " + cmd);
+    gsm.println(cmd);
+    unsigned long startTime = millis();
+    gsm_response = "";
+
+    while (millis() - startTime < timeout)
+    {
+        if (gsm.available())
+        {
+            gsm_response = gsm.readString();
+            gsm_response.trim();
+            Serial.println("Response: " + gsm_response);
+
+            if (gsm_response.indexOf(response) >= 0)
+            {
+                return true;
+            }
+        }
+    }
+    Serial.println(F("❌ GSM Response Timeout."));
+    return false;
+}
+
+void initializeGSM()
+{
+    gsm.begin(115200);
+    delay(10000);
+    gsm.println(F("AT+IPR=9600"));
+    delay(5000);
+    gsm.end();
+    gsm.begin(9600);
+
+    // Optional: Enable GPS if required for your module
+    gsm.println(F("AT+CGPS=1,1"));  // For SIM800 series
+    delay(2000);
+}
+
+bool connectGSM()
+{
+    while (!getResponse(F("ATE0"), OK, 1000));
+    while (!getResponse(F("AT+CLIP=1"), OK, 1000));
+    while (!getResponse(F("AT+CVHU=0"), OK, 1000));
+    while (!getResponse(F("AT+CTZU=1"), OK, 1000));
+    while (!getResponse(F("AT+CMGF=1"), OK, 1000));
+    while (!getResponse(F("AT+CSQ"), OK, 1000));
+    while (!getResponse(F("AT+CREG?"), OK, 1000));
+    while (!getResponse(F("AT+CGREG?"), OK, 1000));
+    while (!getResponse(F("AT+CMGD=1,4"), OK, 1000));
+
+    return true;
+}
+
+// GPS parsing section
+
+bool getGPSCoordinates(String &lat, String &lon)
+{
+    unsigned long startTime = millis();
+    while (millis() - startTime < 10000)
+    {
+        if (gsm.available())
+        {
+            String line = gsm.readStringUntil('\n');
+            line.trim();
+            if (line.startsWith("$GPGGA") || line.startsWith("$GPRMC"))
+            {
+                int idx = 0;
+                String parts[15];
+                for (int i = 0; i < line.length(); i++)
+                {
+                    if (line[i] == ',') idx++;
+                    else parts[idx] += line[i];
+                }
+
+                if (line.startsWith("$GPGGA") && parts[2].length() > 0 && parts[4].length() > 0)
+                {
+                    lat = convertToDecimal(parts[2], parts[3]);
+                    lon = convertToDecimal(parts[4], parts[5]);
+                    return true;
+                }
+                else if (line.startsWith("$GPRMC") && parts[3].length() > 0 && parts[5].length() > 0)
+                {
+                    lat = convertToDecimal(parts[3], parts[4]);
+                    lon = convertToDecimal(parts[5], parts[6]);
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+String convertToDecimal(String raw, String dir)
+{
+    if (raw.length() < 6) return "";
+
+    float deg = raw.substring(0, raw.indexOf('.') - 2).toFloat();
+    float min = raw.substring(raw.indexOf('.') - 2).toFloat();
+    float decimal = deg + (min / 60.0);
+
+    if (dir == "S" || dir == "W") decimal = -decimal;
+
+    return String(decimal, 6);
+}
